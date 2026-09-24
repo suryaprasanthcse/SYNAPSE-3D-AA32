@@ -1,0 +1,70 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1285432337768377810
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 2971490362195060441}
+  - component: {fileID: 251144185282123406}
+  m_Layer: 0
+  m_Name: BoidComputeManager
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &2971490362195060441
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1285432337768377810}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &251144185282123406
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1285432337768377810}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4be8d17e88eb0e6499aa897e50cdcf0d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::MAAYAI.Matrix.Swarm.SwarmManager
+  swarmCompute: {fileID: 7200000, guid: 53180da09ee6c234f914a9be6eb3b040, type: 3}
+  boidMesh: {fileID: 4300000, guid: 866ed46c75b7bce4da8b1bd965ca67c5, type: 2}
+  boidMaterial: {fileID: 2100000, guid: 660c6a52a89e2db4099eb31668cdaec8, type: 2}
+  boidCount: 4096
+  spawnRadius: 10
+  boidScale: 0.25
+  randomSeed: 1337
+  boundsExtents: {x: 25, y: 15, z: 25}
+  boundsWeight: 4
+  minSpeed: 2
+  maxSpeed: 6
+  maxSteerForce: 4
+  maxDeltaTime: 0.033333335
+  separationRadius: 1
+  alignmentRadius: 2.5
+  cohesionRadius: 3.5
+  separationWeight: 1.5
+  alignmentWeight: 1
+  cohesionWeight: 1
+  maxNeighbours: 48
+  castShadows: 0
+  receiveShadows: 0
+  renderCamera: {fileID: 0}
+  renderInAllCameras: 0

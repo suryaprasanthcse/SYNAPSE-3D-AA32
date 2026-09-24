@@ -1,0 +1,267 @@
+// SwarmCompute.compute
+// GPU curl-noise fluid swarm. Simulation runs in the anchor's LOCAL space.
+// Layout is explicitly float4-packed (32 B) so std430 (Vulkan/GLES) and HLSL agree bit-for-bit.
+
+#pragma kernel CSInit
+#pragma kernel CSUpdate
+#pragma multi_compile_local _ SWARM_TURBULENCE_OCTAVE
+
+// 64 = one full warp on Mali Valhall / Immortalis, half a wave on Adreno. Particle count is aligned on the CPU,
+// so no bounds branch is needed in either kernel.
+#define THREADS 64
+
+struct Particle
+{
+    float4 posLife;     // xyz = local position, w = remaining life (s)
+    float4 velInvLife;  // xyz = local velocity, w = 1 / spawn life
+};
+
+RWStructuredBuffer<Particle> _Particles;
+
+float  _DeltaTime;
+float  _RelaxFactor;        // 1 - exp(-responsiveness * dt), computed on CPU
+uint   _FrameSeed;
+
+float3 _NoiseOffsetA;
+float3 _NoiseOffsetB;
+float  _NoiseFrequency;
+float  _FlowSpeed;
+float  _MaxSpeed;
+
+float3 _BoundsCenter;
+float3 _BoundsExtents;
+float3 _InvBoundsExtents;
+float  _SoftShell;          // normalized radius where containment force begins
+float  _ContainStrength;
+float  _HardLimit;          // normalized radius beyond which a particle is recycled
+
+float3 _Attractor;
+float  _AttractorStrength;
+
+float2 _LifeRange;
+float  _SpawnRadius;
+
+// ---------------------------------------------------------------------------------------------
+// Real-world avoidance (AR Depth API). The environment depth texture holds, per camera pixel, the eye-space
+// distance in metres to the nearest real surface. A particle whose eye depth lands just past that surface is
+// inside the furniture, and is pushed back out along its line of sight - which is the only direction the depth
+// map can vouch for. Particles far behind the surface are genuinely occluded (the far side of a sofa) and are
+// left alone. One texel load per particle; the whole block is skipped when depth is unavailable.
+// ---------------------------------------------------------------------------------------------
+Texture2D<float> _EnvDepth;
+float4   _DepthParams;          // x enabled, y skin (m), z push acceleration (m/s^2), w penetration band (m)
+float4   _DepthTexSize;         // xy texel size of _EnvDepth
+float4x4 _DepthDisplay;         // AR display matrix: viewport uv -> depth texture uv (row-vector convention)
+float4x4 _SwarmToClip;          // camera projection * view * swarm local-to-world (non-GPU projection)
+float4   _CameraPosLocal;       // camera position in swarm local space
+float    _WorldToLocalScale;    // local units per world metre
+
+// ---------------------------------------------------------------------------------------------
+// RNG (PCG hash)
+// ---------------------------------------------------------------------------------------------
+uint PcgHash(uint v)
+{
+    uint state = v * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float Rand01(inout uint s)
+{
+    s = PcgHash(s);
+    return (float)(s >> 8) * (1.0 / 16777216.0);
+}
+
+float3 RandInUnitSphere(inout uint s)
+{
+    float u   = Rand01(s) * 2.0 - 1.0;
+    float phi = Rand01(s) * 6.28318530718;
+    float r   = pow(Rand01(s), 0.33333333);
+    float sn, cs;
+    sincos(phi, sn, cs);
+    float sq = sqrt(saturate(1.0 - u * u));
+    return float3(sq * cs, u, sq * sn) * r;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 3D simplex noise, analytic gradient only (value path stripped).
+// ---------------------------------------------------------------------------------------------
+float3 Mod289(float3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 Mod289(float4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+float4 Permute(float4 x) { return Mod289((x * 34.0 + 10.0) * x); }
+float4 TaylorInvSqrt(float4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+float3 SimplexGradient(float3 v)
+{
+    const float2 C  = float2(1.0 / 6.0, 1.0 / 3.0);
+    const float3 ns = float3(0.285714285714, -0.928571428571, 0.142857142857);
+
+    float3 i  = floor(v + dot(v, C.yyy));
+    float3 x0 = v - i + dot(i, C.xxx);
+
+    float3 g  = step(x0.yzx, x0.xyz);
+    float3 l  = 1.0 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+
+    float3 x1 = x0 - i1 + C.xxx;
+    float3 x2 = x0 - i2 + C.yyy;
+    float3 x3 = x0 - 0.5;
+
+    i = Mod289(i);
+    float4 p = Permute(Permute(Permute(
+                   i.z + float4(0.0, i1.z, i2.z, 1.0))
+                 + i.y + float4(0.0, i1.y, i2.y, 1.0))
+                 + i.x + float4(0.0, i1.x, i2.x, 1.0));
+
+    float4 j  = p - 49.0 * floor(p * ns.z * ns.z);
+    float4 x_ = floor(j * ns.z);
+    float4 y_ = floor(j - 7.0 * x_);
+
+    float4 x = x_ * ns.x + ns.yyyy;
+    float4 y = y_ * ns.x + ns.yyyy;
+    float4 h = 1.0 - abs(x) - abs(y);
+
+    float4 b0 = float4(x.xy, y.xy);
+    float4 b1 = float4(x.zw, y.zw);
+    float4 s0 = floor(b0) * 2.0 + 1.0;
+    float4 s1 = floor(b1) * 2.0 + 1.0;
+    float4 sh = -step(h, (float4)0.0);
+
+    float4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    float4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+    float3 p0 = float3(a0.xy, h.x);
+    float3 p1 = float3(a0.zw, h.y);
+    float3 p2 = float3(a1.xy, h.z);
+    float3 p3 = float3(a1.zw, h.w);
+
+    float4 norm = TaylorInvSqrt(float4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+    p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+
+    float4 m  = max(0.5 - float4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+    float4 m2 = m * m;
+    float4 m4 = m2 * m2;
+    float4 t  = m2 * m * float4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3));
+
+    float3 grad = -8.0 * (t.x * x0 + t.y * x1 + t.z * x2 + t.w * x3);
+    grad += m4.x * p0 + m4.y * p1 + m4.z * p2 + m4.w * p3;
+    return grad * 105.0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Curl field: v = gradA x gradB is divergence-free (div(grad a x grad b) == 0) and needs
+// 2 gradient evaluations instead of the 3 potentials / 6 finite differences of classic curl noise.
+// ---------------------------------------------------------------------------------------------
+float3 CurlFlow(float3 pos)
+{
+    float3 x  = pos * _NoiseFrequency;
+    float3 gA = SimplexGradient(x + _NoiseOffsetA);
+    float3 gB = SimplexGradient(x + _NoiseOffsetB);
+
+#if defined(SWARM_TURBULENCE_OCTAVE)
+    float3 x2 = x * 2.07;
+    gA += SimplexGradient(x2 + _NoiseOffsetB.zxy) * 0.5;
+    gB += SimplexGradient(x2 + _NoiseOffsetA.yzx) * 0.5;
+#endif
+
+    float3 v = cross(gA, gB);
+    // Direction-preserving soft normalize: streamlines unchanged, magnitude bounded to (0, 1).
+    return v * rsqrt(dot(v, v) + 1.0);
+}
+
+Particle Spawn(uint seed, float lifeScale)
+{
+    uint s = seed;
+    Particle p;
+    float3 pos  = _BoundsCenter + RandInUnitSphere(s) * _BoundsExtents * _SpawnRadius;
+    float  life = lerp(_LifeRange.x, _LifeRange.y, Rand01(s));
+    float  age  = lerp(1.0, Rand01(s), lifeScale);
+    p.posLife    = float4(pos, life * age);
+    p.velInvLife = float4(0.0, 0.0, 0.0, 1.0 / life);
+    return p;
+}
+
+[numthreads(THREADS, 1, 1)]
+void CSInit(uint3 id : SV_DispatchThreadID)
+{
+    // Stagger initial lifetimes so the population never recycles in lockstep.
+    _Particles[id.x] = Spawn(PcgHash(id.x * 0x9E3779B1u ^ 0xA511E9B3u), 1.0);
+}
+
+[numthreads(THREADS, 1, 1)]
+void CSUpdate(uint3 id : SV_DispatchThreadID)
+{
+    Particle p = _Particles[id.x];
+
+    float life = p.posLife.w - _DeltaTime;
+    [branch]
+    if (life <= 0.0)
+    {
+        _Particles[id.x] = Spawn(PcgHash(id.x * 0x9E3779B1u ^ _FrameSeed), 0.0);
+        return;
+    }
+
+    float3 pos = p.posLife.xyz;
+    float3 vel = p.velInvLife.xyz;
+
+    // Fluid intelligence: relax velocity toward the divergence-free curl field.
+    float3 target = CurlFlow(pos) * _FlowSpeed;
+
+    // Anomaly core attractor (constant-magnitude pull, singularity-safe).
+    float3 toCore = _Attractor - pos;
+    float3 accel  = toCore * (_AttractorStrength * rsqrt(dot(toCore, toCore) + 1e-4));
+
+    // Ellipsoidal containment: quadratic ramp beyond the soft shell, directed along the ellipsoid normal.
+    float3 q    = (pos - _BoundsCenter) * _InvBoundsExtents;
+    float  d    = length(q);
+    float  over = max(d - _SoftShell, 0.0);
+    float3 n    = q * _InvBoundsExtents;
+    accel -= n * rsqrt(dot(n, n) + 1e-8) * (over * over * _ContainStrength);
+
+    [branch]
+    if (_DepthParams.x > 0.5)
+    {
+        float4 clipPos = mul(_SwarmToClip, float4(pos, 1.0));
+        if (clipPos.w > 0.05)
+        {
+            float2 ndc = clipPos.xy / clipPos.w;
+            if (abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0)
+            {
+                float2 viewportUV = ndc * 0.5 + 0.5;
+                float2 tc = mul(float4(viewportUV, 1.0, 0.0), _DepthDisplay).xy;
+                int2 texel = clamp((int2)(tc * _DepthTexSize.xy), int2(0, 0), (int2)_DepthTexSize.xy - 1);
+                float realDistance = _EnvDepth.Load(int3(texel, 0));
+
+                // Eye depth of the particle (GL-style projection: w is the view-space distance).
+                float penetration = clipPos.w - (realDistance - _DepthParams.y);
+                if (realDistance > 0.05 && penetration > 0.0 && penetration < _DepthParams.w)
+                {
+                    float3 toCamera = _CameraPosLocal.xyz - pos;
+                    float3 outward = toCamera * rsqrt(dot(toCamera, toCamera) + 1e-8);
+
+                    // Stronger the deeper it has gone, and never keep moving further in.
+                    float depth01 = saturate(penetration / max(_DepthParams.y, 1e-3));
+                    accel += outward * (_DepthParams.z * (0.35 + depth01) * _WorldToLocalScale);
+                    float inward = dot(vel, -outward);
+                    if (inward > 0.0) vel += outward * inward;
+                }
+            }
+        }
+    }
+
+    vel = lerp(vel, target, _RelaxFactor) + accel * _DeltaTime;
+
+    // Speed clamp (branchless).
+    vel *= min(1.0, _MaxSpeed * rsqrt(max(dot(vel, vel), 1e-8)));
+
+    pos += vel * _DeltaTime;
+
+    // Escaped particles are zeroed; renderer collapses them to degenerate quads and they respawn next tick.
+    life = (d > _HardLimit) ? 0.0 : life;
+
+    p.posLife.xyz    = pos;
+    p.posLife.w      = life;
+    p.velInvLife.xyz = vel;
+    _Particles[id.x] = p;
+}

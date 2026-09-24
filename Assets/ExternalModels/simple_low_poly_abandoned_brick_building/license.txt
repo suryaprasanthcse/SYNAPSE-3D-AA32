@@ -1,0 +1,11 @@
+Model Information:
+* title:	Simple Low Poly Abandoned Brick Building
+* source:	https://sketchfab.com/3d-models/simple-low-poly-abandoned-brick-building-9ea419e574b642c69c6e5a966f692fc4
+* author:	jimbogies (https://sketchfab.com/jimbogies)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Simple Low Poly Abandoned Brick Building" (https://sketchfab.com/3d-models/simple-low-poly-abandoned-brick-building-9ea419e574b642c69c6e5a966f692fc4) by jimbogies (https://sketchfab.com/jimbogies) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

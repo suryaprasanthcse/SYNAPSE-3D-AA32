@@ -1,0 +1,549 @@
+// =============================================================================
+//  SwarmCompute.compute
+//  3D Compute Matrix - Phase 4: dispatch compression + GPU-side instance matrices
+//
+//  Per-frame pipeline (dispatched in this order by SwarmManager):
+//
+//   1. CSClearGrid          [cells]   Reset every cell range to empty.
+//   2. CSHashBoids          [P]       Hash each boid to its cell -> (cellIndex, boidIndex).
+//   3. CSBitonicSortLocal   [blocks]  Fully sort every B-sized block (one dispatch), then
+//      CSBitonicSortGlobal  [P]       for each merge size k > B: one global dispatch per
+//      CSBitonicSortLocal   [blocks]  compare distance j >= B, then ONE local dispatch
+//                                     that finishes every j < B inside each block.
+//      CSBuildGrid          [N]       Gather boids into cell-sorted order, record ranges.
+//   4. CSSwarmUpdate        [N]       Boids rules over the 3x3x3 neighbourhood, then
+//                                     writes the boid's 3x4 object-to-world matrix.
+//
+//  Dispatch compression: a plain bitonic network needs log2(P)*(log2(P)+1)/2
+//  dispatches (78 at P = 4096). With B = 512 the network above needs
+//  1 + sum over k in {1024, 2048, 4096} of (log2(k/B) + 1) = 10 dispatches.
+//
+//  Local sort design: each thread of CSBitonicSortLocal owns one whole block
+//  and runs that block's compare-exchange stages sequentially. For j < B the
+//  partner i^j never leaves the block, so blocks never touch each other: race
+//  free, with no groupshared memory or barriers. Every thread runs the same
+//  fixed number of iterations, so SIMD warps stay coherent. Barriers were
+//  rejected because they force every thread in a group to synchronise each
+//  phase, and they don't exist on Vulkan or Metal.
+//
+//  Settings arrive in ONE constant buffer (SwarmParams) uploaded once per
+//  frame. Only the sort-step integers remain as individual globals.
+//
+//  N = boid count, P = N rounded up to a power of two, B = _BlockSize = min(512, P).
+// =============================================================================
+
+#pragma kernel CSClearGrid
+#pragma kernel CSHashBoids
+#pragma kernel CSBitonicSortGlobal
+#pragma kernel CSBitonicSortLocal
+#pragma kernel CSBuildGrid
+#pragma kernel CSSwarmUpdate
+
+// 64 = two NVIDIA 32-wide warps / one AMD 64-wide warp; within the 1024
+// invocation limit everywhere. SwarmManager reads it per kernel.
+#define THREAD_GROUP_SIZE 64
+#define EMPTY_CELL 0xFFFFFFFF
+
+// Hard ceiling on boids examined per boid per frame.
+#define MAX_SCAN_PER_BOID 64
+
+// Layout must match SwarmManager.BoidStride (32 bytes: float3+float pairs pack
+// identically on D3D, Vulkan std430 and Metal).
+struct Boid
+{
+    float3 position;
+    float  swimPhase;   // procedural animation phase in cycles [0, 1); travels with the boid through the sort
+    float3 velocity;
+    float  padding;
+};
+
+// Layout must match SwarmManager.GridEntryStride (8 bytes).
+struct GridEntry
+{
+    uint cellIndex;
+    uint boidIndex;
+};
+
+// Layout must match SwarmManager.RenderDataStride (64 bytes) and SwarmBoidIndirect.shader.
+// Rows of a 3x4 object-to-world matrix: rowN = (right.N, up.N, forward.N) * scale, position.N.
+struct BoidRenderData
+{
+    float4 row0;
+    float4 row1;
+    float4 row2;
+    float4 data;    // x = speed (world units / s), y = swim phase (cycles [0, 1)), zw reserved
+};
+
+// ---- Per-frame settings: ONE constant buffer, one upload ----------------------
+// Layout must match SwarmManager.SwarmParams exactly (8 x 16 bytes = 128 bytes).
+cbuffer SwarmParams
+{
+    uint   _BoidCount;
+    uint   _PaddedCount;
+    uint   _CellCount;
+    uint   _MaxNeighbours;          // 0 = unlimited (still subject to MAX_SCAN_PER_BOID)
+
+    float3 _GridOrigin;
+    float  _InvCellSize;
+
+    float3 _GridDims;               // whole numbers sent as floats
+    float  _DeltaTime;
+
+    float  _PerceptionRadiusSq;
+    float  _SeparationRadiusSq;
+    float  _AlignmentRadiusSq;
+    float  _CohesionRadiusSq;
+
+    float  _SeparationWeight;
+    float  _AlignmentWeight;
+    float  _CohesionWeight;
+    float  _BoundsWeight;
+
+    float  _MinSpeed;
+    float  _MaxSpeed;
+    float  _MaxSteerForce;
+    float  _BoidScale;
+
+    float3 _BoundsCenter;
+    float  _SwimSpeed;              // stroke cycles per second at _MaxSpeed (mirrored from the material)
+
+    float3 _BoundsExtents;
+    float  _SwarmParamsPad1;
+};
+
+// ---- Sort step state: tiny $Globals, changes per sort dispatch ----------------
+uint _SortK;        // merge size; 0 = local full block sort
+uint _SortJ;        // compare distance (global kernel only)
+uint _BlockSize;    // B, power of two, set once per allocation
+
+// ---- Buffers (bound per kernel by SwarmManager) ------------------------------
+StructuredBuffer<Boid>             _BoidsIn;            // Hash, Build     : authoritative state
+RWStructuredBuffer<Boid>           _BoidsSortedOut;     // Build           : cell-sorted copy
+StructuredBuffer<Boid>             _BoidsSorted;        // Update          : cell-sorted copy
+RWStructuredBuffer<Boid>           _BoidsOut;           // Update          : authoritative state
+RWStructuredBuffer<BoidRenderData> _BoidRenderDataOut;  // Update          : instance matrices (rendered)
+RWStructuredBuffer<GridEntry>      _GridEntries;        // Hash, Sorts, Build
+RWStructuredBuffer<uint>           _CellStart;          // Clear, Build
+RWStructuredBuffer<uint>           _CellEnd;            // Clear, Build
+StructuredBuffer<uint>             _CellStartRead;      // Update
+StructuredBuffer<uint>             _CellEndRead;        // Update
+
+static const float EPSILON          = 1e-6;
+static const float FLOAT_MAX        = 3.402823e38;
+static const float TWO_PI           = 6.2831853;
+static const float MIN_DISTANCE     = 0.001;   // denominator floor
+static const float OVERLAP_DISTANCE = 0.01;    // below this, jitter repulsion fires
+static const float OVERLAP_NUDGE    = 0.05;    // direct position displacement on overlap
+
+// Soft steering starts inside this fraction of the extents; the hard wall is at 1.0.
+static const float SOFT_BOUNDS_FRACTION = 0.85;
+
+// 3x3x3 neighbourhood, own cell first so a capped scan covers likely overlaps first.
+static const int3 NEIGHBOUR_OFFSETS[27] =
+{
+    int3( 0, 0, 0),
+    int3(-1, 0, 0), int3( 1, 0, 0), int3( 0,-1, 0), int3( 0, 1, 0), int3( 0, 0,-1), int3( 0, 0, 1),
+    int3(-1,-1, 0), int3( 1,-1, 0), int3(-1, 1, 0), int3( 1, 1, 0),
+    int3(-1, 0,-1), int3( 1, 0,-1), int3(-1, 0, 1), int3( 1, 0, 1),
+    int3( 0,-1,-1), int3( 0, 1,-1), int3( 0,-1, 1), int3( 0, 1, 1),
+    int3(-1,-1,-1), int3( 1,-1,-1), int3(-1, 1,-1), int3( 1, 1,-1),
+    int3(-1,-1, 1), int3( 1,-1, 1), int3(-1, 1, 1), int3( 1, 1, 1)
+};
+
+// =============================================================================
+//  Hashing
+// =============================================================================
+
+// PCG-style integer hash (Jarzynski & Olano, JCGT 2020).
+uint Hash(uint value)
+{
+    uint state = value * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float Hash01(uint value)
+{
+    return Hash(value) * (1.0 / 4294967295.0);
+}
+
+// Uniformly distributed unit vector; never zero-length.
+float3 RandomUnitVector(uint seed)
+{
+    float z   = Hash01(seed) * 2.0 - 1.0;
+    float phi = Hash01(seed ^ 0x9E3779B9u) * TWO_PI;
+    float r   = sqrt(saturate(1.0 - z * z));
+    return float3(r * cos(phi), z, r * sin(phi));
+}
+
+// =============================================================================
+//  Safety helpers
+// =============================================================================
+
+// NaN/Inf detection. `abs(v) <= FLOAT_MAX` also catches NaN, as a backstop if a
+// compiler folds isnan() away.
+bool IsInvalid(float3 v)
+{
+    return any(isnan(v)) || any(isinf(v)) || !all(abs(v) <= FLOAT_MAX);
+}
+
+// Invalid positions scatter to a hashed point inside 80% of the bounds.
+float3 SanitizePosition(float3 position, uint seed)
+{
+    float3 u = float3(Hash01(seed * 3u + 1u), Hash01(seed * 3u + 2u), Hash01(seed * 3u + 3u)) * 2.0 - 1.0;
+    float3 scattered = _BoundsCenter + u * abs(_BoundsExtents) * 0.8;
+    return IsInvalid(position) ? scattered : position;
+}
+
+float3 SanitizeVelocity(float3 velocity)
+{
+    return IsInvalid(velocity) ? float3(0.0, 0.0, 0.0) : velocity;
+}
+
+float SanitizePhase(float phase)
+{
+    return (isnan(phase) || isinf(phase)) ? 0.0 : frac(phase);
+}
+
+// Clamps in float space BEFORE the int cast: casting NaN/huge floats to int is undefined.
+int3 CellCoordOf(float3 positionWS)
+{
+    float3 dimsMax = max(_GridDims, 1.0) - 1.0;
+    float3 safePosition = IsInvalid(positionWS) ? _BoundsCenter : positionWS;
+    float3 coord = floor((safePosition - _GridOrigin) * _InvCellSize);
+    return (int3)clamp(coord, 0.0, dimsMax);
+}
+
+uint CellIndexOf(int3 coord)
+{
+    uint3 dims = (uint3)max(_GridDims, 1.0);
+    uint index = (uint)coord.x + dims.x * ((uint)coord.y + dims.y * (uint)coord.z);
+    return min(index, _CellCount - 1);
+}
+
+// =============================================================================
+//  Kernel 1: clear grid
+//  Ownership: thread i writes only cell i.
+// =============================================================================
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSClearGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _CellCount)
+        return;
+
+    _CellStart[id.x] = 0;
+    _CellEnd[id.x] = 0;
+}
+
+// =============================================================================
+//  Kernel 2: hash boids to cells
+//  Ownership: thread i writes only entry i.
+// =============================================================================
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSHashBoids(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _PaddedCount)
+        return;
+
+    // Clamped read so padding slots stay in bounds even if branches are flattened.
+    uint cellIndex = CellIndexOf(CellCoordOf(_BoidsIn[min(i, _BoidCount - 1)].position));
+
+    GridEntry entry;
+    entry.boidIndex = i;
+    entry.cellIndex = i < _BoidCount ? cellIndex : EMPTY_CELL;   // padding sorts to the tail
+
+    _GridEntries[i] = entry;
+}
+
+// =============================================================================
+//  Kernel 3: bitonic sort
+// =============================================================================
+
+// Total order: cell first, boid index as tie-break (deterministic cell contents).
+bool EntryGreater(GridEntry a, GridEntry b)
+{
+    return a.cellIndex > b.cellIndex
+        || (a.cellIndex == b.cellIndex && a.boidIndex > b.boidIndex);
+}
+
+// One compare-exchange of the bitonic network. Acts only from the lower index.
+void CompareExchange(uint i, uint j, uint k)
+{
+    uint partner = i ^ j;
+    if (partner <= i || partner >= _PaddedCount)
+        return;
+
+    GridEntry a = _GridEntries[i];
+    GridEntry b = _GridEntries[partner];
+    bool ascending = (i & k) == 0;
+
+    if (EntryGreater(a, b) == ascending)
+    {
+        _GridEntries[i] = b;
+        _GridEntries[partner] = a;
+    }
+}
+
+// 3a. Single network step with compare distance _SortJ >= _BlockSize.
+//     Ownership: pairs (i, i^j) are disjoint and only the lower index acts.
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSBitonicSortGlobal(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _PaddedCount)
+        return;
+
+    CompareExchange(id.x, _SortJ, _SortK);
+}
+
+// 3b. Thread = block. Runs every step with j < _BlockSize for its block:
+//     _SortK == 0 : full sort of the block (k = 2 .. B)
+//     _SortK  > 0 : finish merge size k (j = B/2 .. 1)
+//     Ownership: for j < B the partner i^j stays inside the block.
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSBitonicSortLocal(uint3 id : SV_DispatchThreadID)
+{
+    uint blockStart = id.x * _BlockSize;
+    if (blockStart >= _PaddedCount)
+        return;
+
+    uint blockEnd = blockStart + _BlockSize;
+    uint kFirst = _SortK == 0 ? 2u : _SortK;
+    uint kLast  = _SortK == 0 ? _BlockSize : _SortK;
+
+    [loop]
+    for (uint k = kFirst; k <= kLast; k <<= 1)
+    {
+        [loop]
+        for (uint j = min(k, _BlockSize) >> 1; j > 0; j >>= 1)
+        {
+            [loop]
+            for (uint i = blockStart; i < blockEnd; i++)
+                CompareExchange(i, j, k);
+        }
+    }
+}
+
+// =============================================================================
+//  Kernel 3c: gather into sorted order + record cell offsets
+//  Ownership: thread i writes sorted[i]; start[c] only at the first entry of c;
+//  end[c] only at the last entry of c.
+// =============================================================================
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSBuildGrid(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _BoidCount)
+        return;
+
+    GridEntry entry = _GridEntries[i];
+    bool valid = entry.cellIndex < _CellCount && entry.boidIndex < _BoidCount;
+
+    uint sourceIndex = min(entry.boidIndex, _BoidCount - 1);
+    Boid source = _BoidsIn[sourceIndex];
+    source.position = SanitizePosition(source.position, sourceIndex);
+    source.velocity = SanitizeVelocity(source.velocity);
+    source.swimPhase = SanitizePhase(source.swimPhase);
+    _BoidsSortedOut[i] = source;
+
+    if (!valid)
+        return;
+
+    // HLSL `||` does not short-circuit: neighbour reads use always-valid indices.
+    uint prevCell = _GridEntries[max(i, 1u) - 1u].cellIndex;
+    uint nextCell = _GridEntries[min(i + 1u, _BoidCount - 1u)].cellIndex;
+
+    if (i == 0 || prevCell != entry.cellIndex)
+        _CellStart[entry.cellIndex] = i;
+
+    if (i + 1u == _BoidCount || nextCell != entry.cellIndex)
+        _CellEnd[entry.cellIndex] = i + 1u;
+}
+
+// =============================================================================
+//  Kernel 4: swarm logic over the 3x3x3 neighbourhood + instance matrix
+//  Ownership: thread i writes only state[i] and renderData[i].
+// =============================================================================
+
+// Reynolds steering, branch-free and NaN-free.
+float3 SteerTowards(float3 direction, float3 velocity)
+{
+    float lenSq = dot(direction, direction);
+    float valid = step(EPSILON, lenSq);
+
+    float3 steer = direction * (_MaxSpeed * rsqrt(max(lenSq, EPSILON))) - velocity;
+    float steerLenSq = dot(steer, steer);
+    steer *= min(1.0, _MaxSteerForce * rsqrt(max(steerLenSq, EPSILON)));
+
+    return steer * valid;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CSSwarmUpdate(uint3 id : SV_DispatchThreadID)
+{
+    uint boidIndex = id.x;
+    if (boidIndex >= _BoidCount)
+        return;
+
+    Boid boid = _BoidsSorted[boidIndex];
+    boid.position = SanitizePosition(boid.position, boidIndex);
+    boid.velocity = SanitizeVelocity(boid.velocity);
+
+    float3 separation     = 0.0;
+    float3 alignment      = 0.0;
+    float3 cohesionSum    = 0.0;
+    uint   cohesionCount  = 0;
+    uint   neighbourCount = 0;
+    uint   overlapCount   = 0;
+    uint   scanned        = 0;
+    uint   neighbourLimit = _MaxNeighbours == 0 ? MAX_SCAN_PER_BOID : min(_MaxNeighbours, MAX_SCAN_PER_BOID);
+
+    float3 jitterDirection = RandomUnitVector(Hash(boidIndex));
+    uint   scanSeed        = Hash(boidIndex ^ 0x68E31DA4u);
+
+    int3 dims = (int3)max(_GridDims, 1.0);
+    int3 cell = CellCoordOf(boid.position);
+
+    [loop]
+    for (uint c = 0; c < 27 && scanned < MAX_SCAN_PER_BOID && neighbourCount < neighbourLimit; c++)
+    {
+        int3 neighbourCell = cell + NEIGHBOUR_OFFSETS[c];
+        if (any(neighbourCell < 0) || any(neighbourCell >= dims))
+            continue;
+
+        uint cellIndex = CellIndexOf(neighbourCell);
+
+        // Range clamped to the buffer: corrupt offsets can't overrun or loop away.
+        uint end   = min(_CellEndRead[cellIndex], _BoidCount);
+        uint start = min(_CellStartRead[cellIndex], end);
+        uint count = end - start;
+        if (count == 0)
+            continue;
+
+        // Hashed start offset; wrap by one conditional subtraction (no integer
+        // division in the inner loop).
+        uint rotation = Hash(scanSeed + c) % count;
+
+        [loop]
+        for (uint k = 0; k < count; k++)
+        {
+            if (scanned >= MAX_SCAN_PER_BOID || neighbourCount >= neighbourLimit)
+                break;
+            scanned++;
+
+            uint j = start + rotation + k;
+            if (j >= end)
+                j -= count;
+
+            if (j == boidIndex)
+                continue;
+
+            Boid other = _BoidsSorted[j];
+            float3 offset = other.position - boid.position;
+            float  distSq = dot(offset, offset);
+
+            if (!(distSq <= _PerceptionRadiusSq))   // also rejects NaN
+                continue;
+
+            float dist = max(sqrt(distSq), MIN_DISTANCE);
+
+            if (dist < OVERLAP_DISTANCE)
+            {
+                separation += jitterDirection / MIN_DISTANCE;
+                overlapCount++;
+            }
+            else if (distSq < _SeparationRadiusSq)
+            {
+                separation -= (offset / dist) / dist;
+            }
+
+            if (distSq < _AlignmentRadiusSq)
+                alignment += other.velocity;
+
+            if (distSq < _CohesionRadiusSq)
+            {
+                cohesionSum += other.position;
+                cohesionCount++;
+            }
+
+            neighbourCount++;
+        }
+    }
+
+    float3 acceleration = SteerTowards(separation, boid.velocity) * _SeparationWeight
+                        + SteerTowards(alignment,  boid.velocity) * _AlignmentWeight;
+
+    if (cohesionCount > 0 && overlapCount == 0)
+    {
+        float3 toCenter = cohesionSum / (float)cohesionCount - boid.position;
+        acceleration += SteerTowards(toCenter, boid.velocity) * _CohesionWeight;
+    }
+
+    float3 extents       = abs(_BoundsExtents);
+    float3 localPosition = boid.position - _BoundsCenter;
+    float3 softOverflow  = max(abs(localPosition) - extents * SOFT_BOUNDS_FRACTION, 0.0) * sign(localPosition);
+    acceleration -= softOverflow * _BoundsWeight;
+
+    // ---- Integrate --------------------------------------------------------------
+    float3 newVelocity = boid.velocity + acceleration * _DeltaTime;
+    float3 newPosition = boid.position;
+
+    if (overlapCount > 0)
+    {
+        newVelocity  = jitterDirection * max(_MaxSpeed, 0.0);
+        newPosition += jitterDirection * OVERLAP_NUDGE;
+    }
+
+    newVelocity = SanitizeVelocity(newVelocity);
+
+    float maxSpeed = max(_MaxSpeed, 0.0);
+    float minSpeed = clamp(_MinSpeed, 0.0, maxSpeed);
+    float speed    = length(newVelocity);
+    float3 heading = speed > EPSILON ? newVelocity / max(speed, EPSILON) : jitterDirection;
+    if (speed > maxSpeed)
+        newVelocity = heading * maxSpeed;
+    else if (speed < minSpeed)
+        newVelocity = heading * minSpeed;
+
+    newPosition += newVelocity * _DeltaTime;
+
+    // ---- Hard bounding box --------------------------------------------------------
+    float3 newLocal = newPosition - _BoundsCenter;
+    float3 outside  = step(extents, abs(newLocal));
+    float3 outward  = step(0.0, newVelocity * sign(newLocal));
+    newVelocity *= 1.0 - 2.0 * outside * outward;
+    newPosition  = _BoundsCenter + clamp(newLocal, -extents, extents);
+
+    // ---- Final NaN/Inf failsafe ---------------------------------------------------
+    if (any(isnan(newVelocity)) || any(isinf(newVelocity)) || IsInvalid(newVelocity))
+        newVelocity = float3(0.0, 0.0, 0.0);
+    newPosition = SanitizePosition(newPosition, boidIndex);
+
+    // ---- Swim phase: integrated, never recomputed from absolute time ------------
+    // phase += rate * dt keeps the stroke continuous when speed changes. A phase of
+    // time * speed would jump by time * dSpeed, i.e. minutes of accumulated error.
+    float strokeRate = max(_SwimSpeed, 0.0) * length(newVelocity) / max(maxSpeed, EPSILON);
+    float newPhase   = frac(SanitizePhase(boid.swimPhase) + strokeRate * _DeltaTime);
+
+    Boid result;
+    result.position  = newPosition;
+    result.swimPhase = newPhase;
+    result.velocity  = newVelocity;
+    result.padding   = 0.0;
+    _BoidsOut[boidIndex] = result;
+
+    // ---- Instance matrix: computed once per boid instead of once per vertex -------
+    float  finalSpeed = length(newVelocity);
+    float3 forward    = finalSpeed > EPSILON ? newVelocity / max(finalSpeed, EPSILON) : jitterDirection;
+    float3 upRef      = abs(forward.y) > 0.999 ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0);
+    float3 right      = normalize(cross(upRef, forward));
+    float3 up         = cross(forward, right);
+    float  scale      = _BoidScale;
+
+    BoidRenderData renderData;
+    renderData.row0 = float4(right.x * scale, up.x * scale, forward.x * scale, newPosition.x);
+    renderData.row1 = float4(right.y * scale, up.y * scale, forward.y * scale, newPosition.y);
+    renderData.row2 = float4(right.z * scale, up.z * scale, forward.z * scale, newPosition.z);
+    renderData.data = float4(finalSpeed, newPhase, 0.0, 0.0);
+    _BoidRenderDataOut[boidIndex] = renderData;
+}

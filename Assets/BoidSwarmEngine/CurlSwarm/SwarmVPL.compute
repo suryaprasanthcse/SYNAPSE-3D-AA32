@@ -1,0 +1,217 @@
+// SwarmVPL.compute
+// Stage A: reduces the particle swarm into a 4x4x4 grid of virtual point lights (VPLs).
+//
+//   CSAccumulate  Each 256-thread group bins its particles into groupshared fixed-point accumulators
+//                 (fast on-chip atomics), then issues at most one global atomic per non-zero field.
+//                 Per cell: emission luminance weight, weight x in-cell position (xyz), emission rgb.
+//   CSResolve     One thread per cell: weighted centre + summed flux, temporally smoothed (EMA) in swarm
+//                 local space, emitted in world space for the SwarmSurface shader. Clears the accumulators.
+
+//   CSVolume      One thread per irradiance-volume texel: gathers the 64 resolved VPLs into an L1 irradiance
+//                 probe (E + dominant direction + directionality). This moves the 64-light loop off the pixel
+//                 shader, which paid it per fragment, onto 2,048 texels paid once per frame.
+
+#pragma kernel CSAccumulate
+#pragma kernel CSResolve
+#pragma kernel CSVolume
+
+#define GRID         4
+#define CELLS        64
+
+// Irradiance volume resolution. Flattened on Y because the swarm is a flattened ellipsoid around Petalo.
+#define VOL_X        16
+#define VOL_Y        8
+#define VOL_Z        16
+#define VOL_THREADS  4          // 4x4x4 per group -> (4, 2, 4) groups
+#define FIELDS       7          // w, w*u.x, w*u.y, w*u.z, r, g, b
+#define ACC_THREADS  256
+#define MAX_CONTRIB  60.0       // per-particle clamp; CPU sizes _FixedScale so the uint sums cannot overflow
+
+struct Particle
+{
+    float4 posLife;     // xyz local position, w remaining life
+    float4 velInvLife;  // xyz local velocity, w 1 / spawn life
+};
+
+struct SwarmVPL
+{
+    float4 posSoftSq;   // xyz world position, w soft-core radius^2 (world m^2)
+    float4 color;       // rgb linear flux, w unused
+};
+
+StructuredBuffer<Particle>   _Particles;
+RWStructuredBuffer<uint>     _VPLAccum;     // CELLS * FIELDS
+RWStructuredBuffer<float4>   _VPLState;     // CELLS * 2: (local pos, valid), (flux rgb, 0)
+RWStructuredBuffer<SwarmVPL> _VPLOut;       // CELLS
+
+uint     _ParticleCount;
+uint     _ParticlesPerThread;
+float    _FixedScale;
+
+float3   _GridMin;          // local space
+float3   _GridCellSize;
+float3   _GridInvCellSize;
+
+float4   _ColorSlow;        // linear
+float4   _ColorFast;        // linear
+float    _EmissionSpeedBoost;
+float    _InvMaxSpeed;
+
+float    _FluxScale;        // light intensity / particle count
+float    _Smoothing;        // EMA factor for this frame
+float    _SoftRadiusSq;     // world m^2
+float4x4 _SwarmLocalToWorld;
+
+// --- Irradiance volume (world space, axis aligned: the mapping a pixel shader can do in 3 mads) ---
+RWTexture3D<float4> _IrrL0;         // rgb: irradiance at the probe. a: unused
+RWTexture3D<float4> _IrrL1;         // xyz: dominant light direction. w: directionality 0..1
+float3   _VolumeMin;                // world position of texel (0,0,0)'s corner
+float3   _VolumeCellSize;           // world size of one texel
+float    _VolumeInvRangeSq;         // 1 / lightRange^2, matching the pixel shader's window
+uint     _VolumeLightCount;         // swarm cells only; beacons stay per-pixel (see SwarmSurface)
+
+groupshared uint gsAccum[CELLS * FIELDS];
+
+// Same emission model as SwarmRender.shader (speed-driven colour, EV boost, life fade), minus the global
+// _EmissionIntensity which is folded into _FluxScale on the CPU.
+float3 ParticleEmission(Particle p)
+{
+    float speedN = saturate(sqrt(dot(p.velInvLife.xyz, p.velInvLife.xyz)) * _InvMaxSpeed);
+    float lifeT  = saturate(p.posLife.w * p.velInvLife.w);
+    float fade   = saturate(lifeT * 5.0) * saturate((1.0 - lifeT) * 10.0);
+    return lerp(_ColorSlow.rgb, _ColorFast.rgb, speedN) * (exp2(_EmissionSpeedBoost * speedN) * fade);
+}
+
+uint ToFixed(float v) { return (uint)(v * _FixedScale + 0.5); }
+
+[numthreads(ACC_THREADS, 1, 1)]
+void CSAccumulate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    for (uint i = gtid.x; i < CELLS * FIELDS; i += ACC_THREADS) gsAccum[i] = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint pid = gid.x * ACC_THREADS * _ParticlesPerThread + gtid.x;
+    for (uint k = 0u; k < _ParticlesPerThread; k++, pid += ACC_THREADS)
+    {
+        if (pid >= _ParticleCount) break;
+
+        Particle p = _Particles[pid];
+        float3 e = min(ParticleEmission(p), MAX_CONTRIB);
+        float  w = min(dot(e, float3(0.2126, 0.7152, 0.0722)), MAX_CONTRIB);
+        if (w <= 1e-4) continue;
+
+        // Grid coordinates; particles in the containment shell clamp into the border cells.
+        float3 g = (p.posLife.xyz - _GridMin) * _GridInvCellSize;
+        int3   c = clamp((int3)floor(g), 0, GRID - 1);
+        float3 u = saturate(g - (float3)c);     // position inside the cell, [0,1] -> non-negative fixed point
+
+        uint o = (uint)(c.x + c.y * GRID + c.z * GRID * GRID) * FIELDS;
+        InterlockedAdd(gsAccum[o + 0], ToFixed(w));
+        InterlockedAdd(gsAccum[o + 1], ToFixed(w * u.x));
+        InterlockedAdd(gsAccum[o + 2], ToFixed(w * u.y));
+        InterlockedAdd(gsAccum[o + 3], ToFixed(w * u.z));
+        InterlockedAdd(gsAccum[o + 4], ToFixed(e.r));
+        InterlockedAdd(gsAccum[o + 5], ToFixed(e.g));
+        InterlockedAdd(gsAccum[o + 6], ToFixed(e.b));
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint j = gtid.x; j < CELLS * FIELDS; j += ACC_THREADS)
+    {
+        uint v = gsAccum[j];
+        if (v != 0u) InterlockedAdd(_VPLAccum[j], v);
+    }
+}
+
+[numthreads(CELLS, 1, 1)]
+void CSResolve(uint3 id : SV_DispatchThreadID)
+{
+    uint cell = id.x;
+    uint o = cell * FIELDS;
+    float inv = 1.0 / _FixedScale;
+
+    float  w   = (float)_VPLAccum[o + 0] * inv;
+    float3 wu  = float3(_VPLAccum[o + 1], _VPLAccum[o + 2], _VPLAccum[o + 3]) * inv;
+    float3 rgb = float3(_VPLAccum[o + 4], _VPLAccum[o + 5], _VPLAccum[o + 6]) * inv;
+
+    [unroll] for (uint f = 0u; f < FIELDS; f++) _VPLAccum[o + f] = 0u;
+
+    uint3  c       = uint3(cell % GRID, (cell / GRID) % GRID, cell / (GRID * GRID));
+    float3 cellMin = _GridMin + (float3)c * _GridCellSize;
+    bool   hasLight     = w > 1e-4;
+    float3 vplCenter = hasLight ? cellMin + (wu / w) * _GridCellSize : cellMin + 0.5 * _GridCellSize;
+
+    float4 prevPos = _VPLState[cell * 2 + 0];
+    float4 prevCol = _VPLState[cell * 2 + 1];
+    bool   hadLight = prevPos.w > 0.5;
+
+    // Position: snap on first light, glide afterwards, hold while the cell is empty (flux fades out in place).
+    float3 pos  = hasLight ? (hadLight ? lerp(prevPos.xyz, vplCenter, _Smoothing) : vplCenter)
+                      : (hadLight ? prevPos.xyz : vplCenter);
+    float3 flux = lerp(prevCol.rgb, rgb * _FluxScale, _Smoothing);
+
+    _VPLState[cell * 2 + 0] = float4(pos, (hasLight || hadLight) ? 1.0 : 0.0);
+    _VPLState[cell * 2 + 1] = float4(flux, 0.0);
+
+    SwarmVPL vpl;
+    vpl.posSoftSq = float4(mul(_SwarmLocalToWorld, float4(pos, 1.0)).xyz, _SoftRadiusSq);
+    vpl.color     = float4(flux, 0.0);
+    _VPLOut[cell] = vpl;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage A2: VPLs -> L1 irradiance volume.
+//
+// The pixel shader used to integrate every VPL per fragment: 64 lights x every lit pixel, and in a void where
+// most of those pixels resolve to black anyway. The same integral is evaluated here, at 16x8x16 probes, and the
+// pixel shader reconstructs from it with two trilinear fetches.
+//
+// Each probe keeps the total irradiance (L0) plus the luminance-weighted mean light direction and how
+// directional the arriving light is. That is enough to rebuild wrapped diffuse AND one specular lobe, which is
+// what the old loop produced - a cell cluster reads as one soft source rather than 64 point lights.
+// ---------------------------------------------------------------------------------------------
+[numthreads(VOL_THREADS, VOL_THREADS, VOL_THREADS)]
+void CSVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= VOL_X || id.y >= VOL_Y || id.z >= VOL_Z) return;
+
+    // The border shell is forced dark so that clamped sampling outside the volume returns exactly zero - the
+    // void stays a void, with no light smeared along the edges of the box.
+    bool border = id.x == 0u || id.y == 0u || id.z == 0u ||
+                  id.x == VOL_X - 1u || id.y == VOL_Y - 1u || id.z == VOL_Z - 1u;
+    if (border)
+    {
+        _IrrL0[id] = 0.0;
+        _IrrL1[id] = float4(0.0, 1.0, 0.0, 0.0);
+        return;
+    }
+
+    float3 probe = _VolumeMin + ((float3)id + 0.5) * _VolumeCellSize;
+
+    float3 irradiance = 0.0;
+    float3 direction  = 0.0;
+
+    [loop]
+    for (uint i = 0u; i < _VolumeLightCount; i++)
+    {
+        SwarmVPL l = _VPLOut[i];
+
+        float3 toLight = l.posSoftSq.xyz - probe;
+        float  d2      = dot(toLight, toLight);
+
+        // Identical falloff to the old per-pixel path: windowed inverse square with a soft core.
+        float  window  = saturate(1.0 - d2 * _VolumeInvRangeSq);
+        float3 E       = l.color.rgb * (window * window * rcp(d2 + l.posSoftSq.w));
+
+        irradiance += E;
+        direction  += (toLight * rsqrt(d2 + 1e-8)) * dot(E, float3(0.2126, 0.7152, 0.0722));
+    }
+
+    float luminance = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
+    float dirLength = length(direction);
+
+    _IrrL0[id] = float4(irradiance, 0.0);
+    _IrrL1[id] = float4(dirLength > 1e-8 ? direction * rcp(dirLength) : float3(0.0, 1.0, 0.0),
+                        saturate(dirLength * rcp(max(luminance, 1e-6))));
+}

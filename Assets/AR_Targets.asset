@@ -1,0 +1,69 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 848409ee8ba454f42a5ddff137688a27, type: 3}
+  m_Name: AR_Targets
+  m_EditorClassIdentifier: Unity.XR.ARSubsystems::UnityEngine.XR.ARSubsystems.XRReferenceImageLibrary
+  m_GuidLow: 5709256747284178624
+  m_GuidHigh: 18072815905835366786
+  m_DataStore:
+    m_Storage: []
+  m_Images:
+  - m_SerializedGuid:
+      m_GuidLow: 4889030363754383930
+      m_GuidHigh: 13531350617189952436
+    m_SerializedTextureGuid:
+      m_GuidLow: 929051697422824045
+      m_GuidHigh: 18256246496486985145
+    m_Size: {x: 0.1, y: 0.15015016}
+    m_SpecifySize: 1
+    m_Name: king of spades
+    m_Texture: {fileID: 2800000, guid: b2dc726da7980ce4b98d137b76375bfd, type: 3}
+  - m_SerializedGuid:
+      m_GuidLow: 5341502962484364740
+      m_GuidHigh: 15120285780729254554
+    m_SerializedTextureGuid:
+      m_GuidLow: 14061565093268745275
+      m_GuidHigh: 7873939530322976490
+    m_Size: {x: 0.1, y: 0.17758153}
+    m_SpecifySize: 1
+    m_Name: all_knowing_eye
+    m_Texture: {fileID: 2800000, guid: 7250ec3bb6f3c324ea9eceef48da456d, type: 3}
+  - m_SerializedGuid:
+      m_GuidLow: 5163704605897975108
+      m_GuidHigh: 1878062064298973852
+    m_SerializedTextureGuid:
+      m_GuidLow: 4459964791024448685
+      m_GuidHigh: 7017731718768229097
+    m_Size: {x: 0.1, y: 0.17907609}
+    m_SpecifySize: 1
+    m_Name: joker
+    m_Texture: {fileID: 2800000, guid: f7c2f4adfa583de4e9fa2b12d1fd6361, type: 3}
+  - m_SerializedGuid:
+      m_GuidLow: 5116627008690520065
+      m_GuidHigh: 4632647329739849356
+    m_SerializedTextureGuid:
+      m_GuidLow: 13773414132122571406
+      m_GuidHigh: 11953742515945150762
+    m_Size: {x: 0.1, y: 0.17771739}
+    m_SpecifySize: 1
+    m_Name: valentoro
+    m_Texture: {fileID: 2800000, guid: b182d28eff2dbf242a19650f7c39e4a5, type: 3}
+  - m_SerializedGuid:
+      m_GuidLow: 5178937055922929570
+      m_GuidHigh: 2483447566340028821
+    m_SerializedTextureGuid:
+      m_GuidLow: 8787915697152946185
+      m_GuidHigh: 16063458123661054282
+    m_Size: {x: 0.1, y: 0.14904891}
+    m_SpecifySize: 1
+    m_Name: queen_of_hearts
+    m_Texture: {fileID: 2800000, guid: 24e17009f2c479f44a112e3d0edeecde, type: 3}
